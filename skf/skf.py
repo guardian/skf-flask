@@ -20,7 +20,7 @@
 """
 
 import contextlib, traceback
-import os, markdown, datetime, string, base64, re, sys, re, requests, mimetypes, smtplib
+import os, markdown, datetime, string, base64, re, sys, re, requests, mimetypes, smtplib, yaml, tempfile, operator
 from OpenSSL import SSL, rand
 from docx import Document
 from BeautifulSoup import BeautifulSoup
@@ -30,7 +30,7 @@ from functools import wraps
 from sqlite3 import dbapi2 as sqlite3
 from flask_bcrypt import Bcrypt
 from flask import Flask, request, session, g, redirect, url_for, \
-     render_template, flash, Markup, make_response
+     render_template, flash, Markup, make_response, send_file
 
 
 
@@ -141,6 +141,15 @@ def valNum(value, countLevel):
 def valBool(value, countLevel):
     return whiteList(r'^(true|false)$', value, countLevel)
 
+def memoize(func):
+    cache = {}
+    @wraps(func)
+    def wrapped(*args, **kwargs):
+        key = (tuple(args), tuple(kwargs.items()))
+        if key not in cache:
+            cache[key] = func(*args, **kwargs)
+        return cache[key]
+    return wrapped
 
 #secret key for flask internal session use
 rand.cleanup()
@@ -1095,6 +1104,7 @@ def add_checklist():
     valNum(project_id, 12)
     project_name = request.form['projectName']
     valAlphaNum(project_name, 12)
+    date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
 
     with contextlib.closing(get_db()) as con:
         #Check if submitted projectID is owned by user
@@ -1131,8 +1141,7 @@ def add_checklist():
                         vulnidx = "vulnID" + qnostr
                         vulnID = f[vulnidx]
                         valNum(vulnID, 12)
-                        
-                        date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+
                         with con as cur:
                             cur.execute('INSERT INTO questionlist (entryDate, answer, projectName, projectID, questionID, vulnID, listName, userID) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
                                     [date, answer, project_name, project_id, questionID, vulnID, 
@@ -1140,61 +1149,77 @@ def add_checklist():
     redirect_url = "/results-checklists"
     return redirect(redirect_url)
 
+@memoize
+def get_checklists(root):
+    config = {}
+    with open(os.path.join(root, "asvs.yaml"), "r") as config_file:
+        config = yaml.load(config_file)
 
-def populate_checklists(checklist_paths, kb_paths, lvl_name, 
-        owasp_ids_lvl, owasp_ygbs_lvl, owasp_kbs_lvl, owasp_contents_lvl, owasp_descs_lvl):
-    owasp_ids = []
-    owasp_ygbs = []
-    owasp_kbs = []
-    owasp_contents = []
-    owasp_descs = []
+    kb_paths = get_filepaths(os.path.join(app.root_path, "markdown/knowledge_base"))
+    kb_paths.sort()
 
-    for path in checklist_paths:
-        basepath = os.path.basename(path)
-        owasp_path_elems = basepath.split("-")
-        owasp_checklist_name = owasp_path_elems[2]
-        if owasp_checklist_name == "ASVS":
-            owasp_checklist_name = "-".join(owasp_path_elems[2:5])
-            parse_index = 6
-        else:
-            parse_index = 4
-        if owasp_checklist_name == lvl_name:
-            owasp_id = get_num(owasp_path_elems[0])
-            owasp_kb = owasp_path_elems[parse_index]
-            owasp_ygb = owasp_path_elems[parse_index + 2]
+    checklists = []
+    for checklist_config in config['checklists']:
+        files = os.listdir(os.path.join(root, checklist_config["id"]))
+        question_files = [filename for filename in files if os.path.splitext(filename)[1] == ".md"]
+        question_files.sort()
+        questions = []
 
-            owasp_ids.append(owasp_id)
-            owasp_kbs.append(owasp_kb)
-            owasp_ygbs.append(owasp_ygb)
-            with open(path, 'r') as pathf:
-                checklistmd = pathf.read()
-            owasp_contents.append(Markup(markdown.markdown(checklistmd)))
+        for question_file in question_files:
+            parts = os.path.splitext(question_file)[0].split("--")
+            question_index = parts[0]
+            knowledge_base_id = None
+            knowledge_base_markup = None
+            knowledge_base_heading = None
+            knowledge_base_raw = None
+            knowledge_base_id = int(parts[1])
+            ygb = ""
+            if re.match("^[ygb]{1,3}$", parts[-1]):
+                ygb = parts[-1]
+
+            markdown_content = ""
+            with open(os.path.join(root, checklist_config["id"], question_file), 'r') as content_file:
+                markdown_content = content_file.read()
+            content = Markup(markdown.markdown(markdown_content))
+            raw = ''.join(BeautifulSoup(content).findAll(text=True)).encode('utf-8')
+            title = raw.splitlines()[0]
 
             descriptions = []
+            knowledge_base_entry = ""
             for kbpath in kb_paths:
                 kbbasepath = os.path.basename(kbpath)
                 path_vuln = get_num(kbbasepath.split("-")[0])
-                if int(owasp_kb) == int(path_vuln):
+                if path_vuln == knowledge_base_id:
                     with open(kbpath, 'r') as kbpathf:
-                        kbmd = kbpathf.read()
-                    description = kbmd.split("**")
-                    descriptions.append(description[2])
-            owasp_descs.append("\n".join(descriptions))
+                        knowledge_base_content = kbpathf.read()
+                        knowledge_base_markup = Markup(markdown.markdown(knowledge_base_content))
+                        knowledge_base_raw = ''.join(BeautifulSoup(knowledge_base_markup).findAll(text=True)).encode('utf-8')
+                        knowledge_base_heading = knowledge_base_raw.splitlines()[0]
 
-    owasp_ids_lvl.append(owasp_ids)
-    owasp_ygbs_lvl.append(owasp_ygbs)
-    owasp_kbs_lvl.append(owasp_kbs)
-    owasp_contents_lvl.append(owasp_contents)
-    owasp_descs_lvl.append(owasp_descs)
+                    descriptions.append(knowledge_base_content.split("**")[2])
+            questions.append({
+                "ygb": ygb,
+                "index": get_num(question_index),
+                "id": question_index,
+                "title": title,
+                "content": content,
+                "description": "\n".join(descriptions),
+                "raw_content": raw,
+                "knowledge_base": knowledge_base_id,
+                "heading": knowledge_base_id == 0,
+                "knowledge_base_entry": knowledge_base_markup,
+                "knowledge_base_heading": knowledge_base_heading,
+                "knowledge_base_raw": knowledge_base_raw
+            })
 
-    return lvl_name
-    
-
-NUM_ASVS_LEVELS = 6
-ASVS_1, ASVS_2, ASVS_3, ASVS_BASIC, ASVS_ADVANCED, ASVS_CUSTOM = range(NUM_ASVS_LEVELS)
-ASVS_NAMES = ("ASVS-level-1", "ASVS-level-2", "ASVS-level-3", "CS_basic_audit", "CS_advanced_audit", "custom")
-ASVS_TITLES = ("OWASP ASVS Level 1", "OWASP ASVS Level 2", "OWASP ASVS Level 3", 
-        "Basic Audit Checklist", "Advanced Audit Checklist", "Custom Checklist")
+        checklists.append({
+            "id": checklist_config['id'],
+            "title": checklist_config['title'],
+            "description": checklist_config['description'],
+            "level": checklist_config['level'],
+            "questions": questions
+        })
+    return checklists
 
 
 @app.route('/project-checklists/<project_id>', methods=['GET'])
@@ -1208,60 +1233,14 @@ def project_checklists(project_id):
         projects = con.execute('SELECT p.projectID, p.userID, p.groupID, p.projectName, p.projectVersion, p.projectDesc, p.ownerID, m.userID, m.groupID FROM projects as p JOIN groupMembers AS m ON m.groupID = p.groupID WHERE p.projectID=? AND m.userID=?',
                             [project_id, session['userID']]).fetchall()
     projectName = ""
-
-    owasp_level_descs = []
-    owasp_level_recommendations = []
-
-    owasp_ids_lvl = []
-    owasp_ygbs_lvl = []
-    owasp_kbs_lvl = []
-    owasp_contents_lvl = []
-    owasp_descs_lvl = []
-
+    checklists = []
     for prep in projects:
         projectName = prep[3]
-        
-        checklist_paths = get_filepaths(os.path.join(app.root_path, "markdown/checklists"))
-        checklist_paths.sort()
-
-        kb_paths = get_filepaths(os.path.join(app.root_path, "markdown/knowledge_base"))
-        kb_paths.sort()
-
-        for level0 in range(NUM_ASVS_LEVELS):
-            level = level0 + 1
-            level_name = ASVS_NAMES[level0]
-            populate_checklists(checklist_paths, kb_paths, level_name,
-                    owasp_ids_lvl, owasp_ygbs_lvl, 
-                    owasp_kbs_lvl, owasp_contents_lvl, owasp_descs_lvl)
-            if level0 < 3:
-                level_desc = "OWASP Application Security Verification Standard Level %d" % (level0 + 1,)
-                if level0 < 2:
-                    level_recommendation = "Recommended"
-                else:
-                    level_recommendation = "Advanced"
-            else:
-                level_desc = ("This checklist is a template for your own %s checklist. "
-                        "If you have created one please create a Pull request on GIT.") % (level_name,)
-                level_recommendation = "Custom"
-            owasp_level_descs.append(level_desc)
-            owasp_level_recommendations.append(level_recommendation)
-
+        checklists = get_checklists(os.path.join(app.root_path, "markdown/checklists"))
         break
 
-    return render_template('project-checklists.html', csrf_token=session['csrf_token'], 
-                NUM_ASVS_LEVELS=NUM_ASVS_LEVELS,
-                ASVS_NAMES=ASVS_NAMES,
-                ASVS_TITLES=ASVS_TITLES,
-                owasp_level_descs=owasp_level_descs,
-                owasp_level_recommendations=owasp_level_recommendations,
-                owasp_ids_lvl=owasp_ids_lvl,
-                owasp_ygbs_lvl=owasp_ygbs_lvl, 
-                owasp_kbs_lvl=owasp_kbs_lvl, 
-                owasp_contents_lvl=owasp_contents_lvl, 
-                owasp_descs_lvl=owasp_descs_lvl,
-                projectName=projectName,
-                project_id=project_id
-            )
+    return render_template('project-checklists.html',
+                           csrf_token=session['csrf_token'], checklists=checklists, project_id=project_id, projectName=projectName)
 
 
 @app.route('/results-checklists', methods=['GET'])
@@ -1338,9 +1317,7 @@ def checklist_results(entryDate):
     """show checklist results report"""
     assert_session()
     permissions("read")
-    ygb = []
-    questions = []
-    content = []
+
     with contextlib.closing(get_db()) as con:
         entries = con.execute("SELECT l.projectID, p.projectName, p.projectVersion, l.listName, l.questionID, l.vulnID FROM questionlist AS l JOIN projects AS p ON p.projectID = l.projectID JOIN groupMembers AS m ON m.groupID = p.groupID WHERE l.answer='no' AND l.entryDate=? AND m.userID=? ORDER BY p.projectName, p.projectVersion, l.listName, l.questionID",
                [entryDate, session['userID']]).fetchall()
@@ -1348,46 +1325,38 @@ def checklist_results(entryDate):
     projectVersion = None
     listName = None
     questionID = None
-    vulnID = None
-    for entry in entries:
-        projectName = entry[1]
-        projectVersion = entry[2]
-        listName = entry[3]
-        questionID = entry[4]
-        vulnID = entry[5]
-        kb_paths = get_filepaths(os.path.join(app.root_path, "markdown/knowledge_base"))
-        for kbpath in kb_paths:
-            kbbasepath = os.path.basename(kbpath)
-            kbpath_vuln = get_num(kbbasepath.split("-")[0])
-            if int(vulnID) == int(kbpath_vuln):
-                with open(kbpath, 'r') as kbpathf:
-                    kbmd = kbpathf.read()
-                content.append(Markup(markdown.markdown(kbmd)))
+    checklist = None
+    questions = []
 
-                checklist_paths = get_filepaths(os.path.join(app.root_path, "markdown/checklists"))
-                ckqs = []
-                ckygbs = []
-                for path in checklist_paths:
-                    basepath = os.path.basename(path)
-                    elems = basepath.split("-")
-                    path_questionID = get_num(elems[0])
-                    if int(questionID) == int(path_questionID):
-                        with open(path, 'r') as pathf:
-                            checklistmd = pathf.read()
-                        ckqs.append(Markup(markdown.markdown(checklistmd)))
-                        checklist_name = elems[2]
-                        if checklist_name == "ASVS":
-                            checklist_name = "-".join(elems[2:5])
-                            checklist_kb = elems[6]
-                            checklist_ygb = elems[8]
-                        else:
-                            checklist_kb = elems[4]
-                            checklist_ygb = elems[6]
-                        ckygbs.append(checklist_ygb)
-                questions.append("\n".join(ckqs))
-                ygb.append(" ".join(ckygbs))
+    if entries:
+        # continue to assume all entries are from the same submission for now
+        projectName = entries[0][1]
+        projectVersion = entries[0][2]
+        listName = entries[0][3]
+        questionID = None
 
-    return render_template('results-checklist-report.html', **locals())
+        checklists = get_checklists(os.path.join(app.root_path, "markdown/checklists"))
+        matched_checklists = filter(lambda c: c["id"] == listName, checklists)
+
+        for matched in matched_checklists:
+            checklist = matched
+            for entry in entries:
+                questionID = entry[4]
+                matching_question = []
+                for checklist_question in checklist["questions"]:
+                    if unicode(checklist_question["index"]) == questionID:
+                        matching_question = [checklist_question]
+                questions += matching_question
+            break  # only take the first matching checklist
+        questions.sort(key=operator.itemgetter('id'))
+
+    return render_template('results-checklist-report.html',
+        entryDate = entryDate,
+        checklist = checklist,
+        questions = questions,
+        projectName = projectName,
+        projectVersion = projectVersion
+    )
 
 
 @app.route('/results-checklist-docx/<entryDate>')
@@ -1395,118 +1364,96 @@ def download_file_checklist(entryDate):
     """Download checklist results report in docx"""
     assert_session()
     permissions("read")
-    ygb_docx = []
-    content_raw = []
-    content_checklist = []
-    content_title = []
+
     with contextlib.closing(get_db()) as con:
         entries = con.execute("SELECT l.projectID, p.projectName, p.projectVersion, l.listName, l.questionID, l.vulnID FROM questionlist AS l JOIN projects AS p ON p.projectID = l.projectID JOIN groupMembers AS m ON m.groupID = p.groupID WHERE l.answer='no' AND l.entryDate=? AND m.userID=? ORDER BY p.projectName, p.projectVersion, l.listName, l.questionID",
                [entryDate, session['userID']]).fetchall()
-    document = Document()
-    document.add_picture(os.path.join(app.root_path,'static/img/banner-docx.jpg'), width=Inches(5.125), height=Inches(1.042))
-    last_paragraph = document.paragraphs[-1]
-    last_paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
-    #document.add_heading('Security Knowledge Framework', 0)
-    last_paragraph = document.paragraphs[-1]
-    last_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    p = document.add_paragraph()
     projectName = None
     projectVersion = None
     listName = None
     questionID = None
-    vulnID = None
-    for entry in entries:
-        projectName = entry[1]
-        projectVersion = entry[2]
-        listName = entry[3]
+    checklist = None
+    questions = []
+
+    if entries:
+        # continue to assume all entries are from the same submission for now
+        projectName = entries[0][1]
+        projectVersion = entries[0][2]
+        listName = entries[0][3]
+        questionID = None
+
+        checklists = get_checklists(os.path.join(app.root_path, "markdown/checklists"))
+        matched_checklists = filter(lambda c: c["id"] == listName, checklists)
+
+        for matched in matched_checklists:
+            checklist = matched
+            for entry in entries:
+                questionID = entry[4]
+                matching_question = []
+                for checklist_question in checklist["questions"]:
+                    if unicode(checklist_question["index"]) == questionID:
+                        matching_question = [checklist_question]
+                questions += matching_question
+            break  # only take the first matching checklist
+        questions.sort(key=operator.itemgetter('id'))
+
+    # title page
+    document = Document()
+    document.add_picture(os.path.join(app.root_path,'static/img/banner-docx.jpg'), width=Inches(5.125), height=Inches(1.042))
+    last_paragraph = document.paragraphs[-1]
+    last_paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    last_paragraph = document.paragraphs[-1]
+    last_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p = document.add_paragraph()
     p.add_run('Project '  + str(projectName) + ' ' + str(projectVersion))
     p.add_run('\r\n')
     p.add_run('Checklist ' + str(listName) + ' answers as of ' + entryDate)
     document.add_page_break()
+
+    # table of contents
     p = document.add_heading('Table of contents', level=1)
     p.add_run('\r\n')
     document.add_paragraph('Introduction')
-    questionID = None
-    vulnID = None
-
-    for entry in entries:
-        questionID = entry[4]
-        vulnID = entry[5]
-        kb_paths = get_filepaths(os.path.join(app.root_path, "markdown/knowledge_base"))
-        for kbpath in kb_paths:
-            kbbasepath = os.path.basename(kbpath)
-            kbpath_vuln = get_num(kbbasepath.split("-")[0])
-            if int(vulnID) == int(kbpath_vuln):
-                with open(kbpath, 'r') as kbpathf:
-                    kbmd = kbpathf.read()
-                content = Markup(markdown.markdown(kbmd))
-                text = ''.join(BeautifulSoup(content).findAll(text=True))
-                text_encode = text.encode('utf-8')
-                content_title.append(text_encode.splitlines()[0])
-                text_encode = text_encode.replace("Solution", "\nSolution");
-                content_raw.append(text_encode)
-
-                checklist_paths = get_filepaths(os.path.join(app.root_path, "markdown/checklists"))
-                ckqs = []
-                ckygbs = []
-                for path in checklist_paths:
-                    basepath = os.path.basename(path)
-                    elems = basepath.split("-")
-                    path_questionID = get_num(elems[0])
-                    if int(questionID) == int(path_questionID):
-                        with open(path, 'r') as pathf:
-                            checklistmd = pathf.read()
-                        ckqs.append(Markup(markdown.markdown(checklistmd)))
-                        checklist_name = elems[2]
-                        if checklist_name == "ASVS":
-                            checklist_name = "-".join(elems[2:5])
-                            checklist_kb = elems[6]
-                            checklist_ygb = elems[8]
-                        else:
-                            checklist_kb = elems[4]
-                            checklist_ygb = elems[6]
-                        ckygbs.append(checklist_ygb)
-                content_checklist.append("\n".join(ckqs))
-                ygb_docx.append(" ".join(ckygbs))
-
-    for item in content_title:
-        p = document.add_paragraph(item)
+    for item in questions:
+        p = document.add_paragraph(item['knowledge_base_heading'])
         p.add_run()
     document.add_page_break()
+
+    # intro
     document.add_heading('Introduction', level=1)
-    p = document.add_paragraph(
+    intro_p = document.add_paragraph(
         'The security knowledge framework is composed by means of the highest security standards currently available and is designed to maintain the integrity of your application, so you and your costumers sensitive data is protected against hackers. This document is provided with a checklist in which the programmers of your application had to run through in order to provide a secure product.'
     )
-    p.add_run('\n')
-    p = document.add_paragraph(
+    intro_p.add_run('\n')
+    document.add_paragraph(
         'In the post-development stage of the security knowledge framework the developer double-checks his application against a checklist which consists out of several questions asking the developer about different stages of development and the methodology of implementing different types of functionality the application contains. After filling in this checklist the developer gains feedback on the failed checklist items providing him with solutions about how to solve the additional vulnerability\'s found in the application.'
     )
     document.add_page_break()
-    i = 0
-    for item in content_raw:
-        document.add_heading(content_title[i], level=1)
-        result = re.sub("<p>", " ", content_checklist[i])
+
+    # entries
+    for question in questions:
+        document.add_heading(question['knowledge_base_heading'], level=1)
+        result = re.sub("<p>", "", question['content'])
         result1 = re.sub("</p>", " ", result)
         document.add_heading(result1, level=4)
-        p = document.add_paragraph(item.partition("\n")[2])
-        ygb = ygb_docx[i]
-        if "y" in ygb:
-            document.add_picture(os.path.join(app.root_path,'static/img/yellow.png'), width=Inches(0.20))
-        if "g" in ygb:
-            document.add_picture(os.path.join(app.root_path,'static/img/green.png'), width=Inches(0.20))
-        if "b" in ygb:
-            document.add_picture(os.path.join(app.root_path,'static/img/blue.png'), width=Inches(0.20))
+        p = document.add_paragraph(question['knowledge_base_raw'].partition("\n")[2])
         p.add_run("\n")
+        if question['ygb']:
+            icon_p = document.add_paragraph()
+            icon_r = icon_p.add_run()
+            if "y" in question['ygb']:
+                icon_r.add_picture(os.path.join(app.root_path,'static/img/yellow.png'), width=Inches(0.20))
+            if "g" in question['ygb']:
+                icon_r.add_picture(os.path.join(app.root_path,'static/img/green.png'), width=Inches(0.20))
+            if "b" in question['ygb']:
+                icon_r.add_picture(os.path.join(app.root_path,'static/img/blue.png'), width=Inches(0.20))
         document.add_page_break()
-        i += 1
-    # FIXME: save in a request-specific location or in memory
-    document.save("checklist-security-report.docx")
-    headers = {"Content-Disposition": "attachment; filename=%s" % "checklist-security-report.docx"}
-    file_path = os.path.join(app.root_path, "checklist-security-report.docx")
-    with open("checklist-security-report.docx", 'rb') as f:
-        body = f.read()
-    return make_response((body, headers))
 
+    temp_f = tempfile.SpooledTemporaryFile()
+    document.save(temp_f)
+    temp_f.seek(0)
+    return send_file(temp_f, as_attachment=True,
+                     attachment_filename="checklist-security-report.docx")
 
 @app.route('/results-function-report/<projectID>', methods=['GET'])
 @security
